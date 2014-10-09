@@ -8,18 +8,49 @@ import Control.Monad.Trans
 import Data.Time
 import Database.Redis
 import Text.Printf
+import Network (HostName, PortID, PortNumber)
+import System.Environment (getArgs)
 
 nRequests, nClients :: Int
 nRequests = 100000
 nClients  = 50
 
+-- | Datatype for command-line arguments.
+data BArgs = HostAndPort HostName PortNumber | Host HostName | Neither
+
+-- | Compute command-line arguments from the real world.
+getBArgs :: IO BArgs
+getBArgs = do
+  args <- getArgs
+  return $ case args of
+    host : port : _ -> readHostAndPort host port 
+    host : [] -> Host host
+    _ -> Neither
+
+  where readHostAndPort host port = let (n, r) : _ = reads port in
+            if r == "" then Host host else HostAndPort host (toEnum n)
+
+-- | Compute ConnectInfo from the real world.
+getConnectInfo :: IO ConnectInfo
+getConnectInfo = getBArgs >>= return . makeConnectInfo
+  where
+    makeConnectInfo :: BArgs -> ConnectInfo
+    makeConnectInfo Neither = defaultConnectInfo
+    makeConnectInfo (Host hn) = defaultConnectInfo { connectHost = hn }
+    makeConnectInfo (HostAndPort hn pn) = defaultConnectInfo {
+          connectHost = hn
+        , connectPort = PortNumber pn
+        }
 
 main :: IO ()
 main = do
+
+    connectInfo <- getConnectInfo
+
     ----------------------------------------------------------------------
     -- Preparation
     --
-    conn <- connect defaultConnectInfo
+    conn <- connect connectInfo
     runRedis conn $ do
         _ <- flushall
         Right _ <- mset [ ("k1","v1"), ("k2","v2"), ("k3","v3")
