@@ -3,6 +3,7 @@
 module Main where
 
 import Control.Concurrent
+import Control.Concurrent.Async
 import Control.Monad
 import Control.Monad.Trans
 import Data.Time
@@ -58,23 +59,20 @@ main = do
     
         return ()
     
-    ----------------------------------------------------------------------
-    -- Spawn clients
-    --
-    start <- newEmptyMVar
-    done  <- newEmptyMVar
-    replicateM_ nClients $ forkIO $ do
-        runRedis conn $ forever $ do
-            action <- liftIO $ takeMVar start
-            action
-            liftIO $ putMVar done ()
-
     let timeAction name nActions action = do
         startT <- getCurrentTime
         -- each clients runs ACTION nRepetitions times
         let nRepetitions = nRequests `div` nClients `div` nActions
-        replicateM_ nClients $ putMVar start (replicateM_ nRepetitions action)
-        replicateM_ nClients $ takeMVar done
+
+        let replicatedAction = replicateM_ nRepetitions action
+
+        -- One replicatedAction for each client.
+        let actions = take nClients $ repeat replicatedAction
+
+        -- Run each of the actions in a new runRedis, against the same
+        -- connection.
+        mapConcurrently (runRedis conn) actions
+
         stopT <- getCurrentTime
         let deltaT     = realToFrac $ diffUTCTime stopT startT
             -- the real # of reqs send. We might have lost some due to 'div'.
