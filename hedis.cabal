@@ -82,7 +82,9 @@ benchmark hedis-benchmark
         base == 4.*,
         mtl == 2.*,
         hedis,
-        time >= 1.2
+        time >= 1.2,
+        criterion,
+        network
     ghc-options: -O2 -Wall -rtsopts
     ghc-prof-options: -auto-all
 

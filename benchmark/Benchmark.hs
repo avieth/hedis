@@ -2,14 +2,12 @@
 
 module Main where
 
-import Control.Concurrent
-import Control.Monad
-import Control.Monad.Trans
-import Data.Time
 import Database.Redis
-import Text.Printf
+import Control.Monad
 import Network (HostName, PortID, PortNumber)
-import System.Environment (getArgs)
+import System.Environment (getEnv)
+import Control.Exception
+import Criterion.Main
 
 nRequests, nClients :: Int
 nRequests = 100000
@@ -21,11 +19,14 @@ data BArgs = HostAndPort HostName PortNumber | Host HostName | Neither
 -- | Compute command-line arguments from the real world.
 getBArgs :: IO BArgs
 getBArgs = do
-  args <- getArgs
-  return $ case args of
-    host : port : _ -> readHostAndPort host port 
-    host : [] -> Host host
-    _ -> Neither
+  host <- catch (getEnv "HEDIS_BENCH_HOST") (\x -> let _ = x :: SomeException in return "")
+  port <- catch (getEnv "HEDIS_BENCH_PORT") (\x -> let _ = x :: SomeException in return "")
+  case (null host, null port) of
+    (True, True) -> return Neither
+    (False, True) -> return $ Host host
+    (False, False) -> return $ readHostAndPort host port
+    -- You can't set the port but not the host; sorry.
+    (True, False) -> return Neither
 
   where readHostAndPort host port = let (n, r) : _ = reads port in
             if r == "" then Host host else HostAndPort host (toEnum n)
@@ -50,6 +51,8 @@ main = do
     ----------------------------------------------------------------------
     -- Preparation
     --
+    -- Here we clear the database and set 5 values.
+    --
     conn <- connect connectInfo
     runRedis conn $ do
         _ <- flushall
@@ -57,67 +60,90 @@ main = do
                         , ("k4","v4"), ("k5","v5") ]
     
         return ()
-    
-    ----------------------------------------------------------------------
-    -- Spawn clients
-    --
-    start <- newEmptyMVar
-    done  <- newEmptyMVar
-    replicateM_ nClients $ forkIO $ do
-        runRedis conn $ forever $ do
-            action <- liftIO $ takeMVar start
-            action
-            liftIO $ putMVar done ()
-
-    let timeAction name nActions action = do
-        startT <- getCurrentTime
-        -- each clients runs ACTION nRepetitions times
-        let nRepetitions = nRequests `div` nClients `div` nActions
-        replicateM_ nClients $ putMVar start (replicateM_ nRepetitions action)
-        replicateM_ nClients $ takeMVar done
-        stopT <- getCurrentTime
-        let deltaT     = realToFrac $ diffUTCTime stopT startT
-            -- the real # of reqs send. We might have lost some due to 'div'.
-            actualReqs = nRepetitions * nActions * nClients
-            rqsPerSec  = fromIntegral actualReqs / deltaT :: Double
-        putStrLn $ printf "%-20s %10.2f Req/s" (name :: String) rqsPerSec
 
     ----------------------------------------------------------------------
     -- Benchmarks
     --
-    timeAction "ping" 1 $ do
-        Right Pong <- ping
-        return ()
-        
-    timeAction "get" 1 $ do
+    -- Here we try our best to define actions such that, when run, the only
+    -- work that will be performed is the work necessary to communicate with
+    -- redis via hedis.
+    --
+
+    let getOnceNoResponse = runRedis conn $ get "key"
+
+    let getOnceResponse = runRedis conn $ do
         Right Nothing <- get "key"
         return ()
-    
-    timeAction "mget" 1 $ do
-        Right vs <- mget ["k1","k2","k3","k4","k5"]
-        let expected = map Just ["v1","v2","v3","v4","v5"]
-        True <- return $ vs == expected
-        return ()
-    
-    timeAction "ping (pipelined)" 100 $ do
-        pongs <- replicateM 100 ping
-        let expected = replicate 100 (Right Pong)
-        True <- return $ pongs == expected
+
+    let getManyNoResponse = runRedis conn $ mget ["k1","k2","k3","k4","k5"]
+
+    let getManyResponse = runRedis conn $ do
+        Right vs <- mget ["v1", "v2", "v3", "v4", "v5"]
+        -- We don't inspect the list because that's not relevant to the benchmark.
+        -- We wish only to know that the value was pulled back from the server.
         return ()
 
-    timeAction "multiExec get 1" 1 $ do
-        TxSuccess _ <- multiExec $ get "foo"
+    let multiExecNoResponse = runRedis conn $ do
+        multiExec $ get "key"
         return ()
-    
-    timeAction "multiExec get 50" 50 $ do
+
+    let multiExecResponse = runRedis conn $ do
+        TxSuccess (Nothing) <- multiExec $ get "key" >>= return
+        return ()
+
+    let multiExec50 = runRedis conn $ do
         TxSuccess 50 <- multiExec $ do
                             rs <- replicateM 50 (get "foo")
                             return $ fmap length (sequence rs)
         return ()
 
-    timeAction "multiExec get 1000" 1000 $ do
+    let multiExec1000 = runRedis conn $ do
         TxSuccess 1000 <- multiExec $ do
                             rs <- replicateM 1000 (get "foo")
                             return $ fmap length (sequence rs)
         return ()
-    
+
+
+    let mixed0 = runRedis conn $ do
+        set "key0" "value0"
+        set "key1" "value1"
+        set "key2" "value2"
+        set "key3" "value3"
+        set "key4" "value4"
+        Right (Just k0) <- get "key0"
+        Right (Just k4) <- get "key4"
+        return ()
+
+    -- Here we define the criterion benchmarks using the above actions.
+    let pingGroup = bgroup "ping" [
+            bench "once_no_response" $ whnfIO (runRedis conn ping)
+          , bench "once_response" $ whnfIO (runRedis conn $ ping >>= \(Right Pong) -> return ())
+          ]
+
+    let getGroup = bgroup "get" [
+            bench "once_no_response" $ whnfIO getOnceNoResponse
+          , bench "once_response" $ whnfIO getOnceResponse
+          , bench "many_no_response" $ whnfIO getManyNoResponse
+          , bench "many_response" $ whnfIO getManyResponse
+          ]
+
+    let multiExecGroup = bgroup "multiexec" [
+            bench "no_response" $ whnfIO multiExecNoResponse
+          , bench "response" $ whnfIO multiExecResponse
+          , bench "50" $ whnfIO multiExec50
+          , bench "1000" $ whnfIO multiExec1000
+          ]
+
+    let mixedGroup = bgroup "mixed" [
+            bench "mixed0" $ whnfIO mixed0
+          ]
+
+
+    let benchmarkGroups = [
+            pingGroup
+          , getGroup
+          , multiExecGroup
+          , mixedGroup
+          ]
+
+    defaultMain benchmarkGroups
